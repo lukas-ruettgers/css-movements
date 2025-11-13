@@ -273,8 +273,10 @@ class CSSMovements(ParallelEnv):
             # Enforce sum(Q) <= available per cell by rescaling if needed
             mask = total_out > available
             if np.any(mask):
+                # NOTE (L): We could also throw an error here.
                 # Avoid division by zero
                 scale = np.zeros_like(available, dtype=np.float32)
+                # NOTE (L): Div by zero should not occur, as the mask condition would otherwise not be satisfied
                 scale[mask] = available[mask] / (total_out[mask] + 1e-9).astype(
                     np.float32
                 )
