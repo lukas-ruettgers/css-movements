@@ -20,3 +20,10 @@ source .venv/bin/activate
 
 # Activate the environment (Windows)
 .\.venv\Scripts\activate
+```
+### 2. Install required packages
+
+Make sure the virtual environment is active, then run:
+```bash
+pip install -r requirements.txt
+```
