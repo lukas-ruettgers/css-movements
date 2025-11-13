@@ -15,81 +15,343 @@ class CSSMovements(ParallelEnv):
         "name": "css_movements_v0",
     }
 
-    def __init__(self, G, H, W, F_G, F_W, seed = SEED):
-        self.H = H
-        self.W = W 
+    def __init__(self, G, H, W, F_G, F_W, seed=SEED):
+        """
+        G   : number of groups (agents)
+        H,W : grid height/width
+        F_G : features per group
+        F_W : features per world cell
+        """
         self.G = G
+        self.H = H
+        self.W = W
         self.F_G = F_G
         self.F_W = F_W
+
         self.time = None
-        self.seed = seed 
-        self.world_occupancy = None
-        self.world_features  = None
-        self.group_features  = None
+        self.seed = seed
 
+        # World state
+        self.world_occupancy = None  # shape (G, H, W)
+        self.world_features = None   # shape (F_W, H, W)
+        self.group_features = None   # shape (G, F_G)
+
+        # RNG
+        self.np_random = np.random.default_rng(self.seed)
+
+        # Agents (PettingZoo style)
+        self.agents = [f"group_{g}" for g in range(self.G)]
+        self.possible_agents = self.agents[:]
+
+        # For simplicity, we assume max strength per cell = 100
+        self.max_strength = 100
+        self._make_action_space()
+
+    # ---------------------------------------------------------------------
+    # Helpers to build spaces
+    # ---------------------------------------------------------------------
+    def _make_action_space(self):
+        """
+        Each group action is a MultiDiscrete vector over all cells and 4
+        directions (up/right/down/left).
+
+        For each cell (x, y) and direction d, the action component is
+        an integer 0..max_strength representing how much to move in that
+        direction. We will clamp/rescale to ensure we never move more
+        than is available.
+        """
+        n_cells = self.H * self.W * 4
+        # Each entry in [0, max_strength]
+        nvec = np.full(n_cells, self.max_strength + 1, dtype=np.int64)
+        self._action_space = MultiDiscrete(nvec)
+
+    # ---------------------------------------------------------------------
+    # PettingZoo API: reset
+    # ---------------------------------------------------------------------
     def reset(self, seed=SEED, options=None):
+        """
+        1. initialize world_occupancy:
+           for each group, randomly sample K=H*W/sparsity non-zero coords
+           and an occupancy value uniform from 1 to 100.
+
+        2. initialize world_features: dummy normal initialization
+
+        3. initialize group_features: dummy normal initialization
+        """
+        if seed is not None:
+            self.seed = seed
+        self.np_random = np.random.default_rng(self.seed)
+
         self.time = 0
-        self.world_occupancy = np.zeros((G, H, W), dtype=np.int32)
-        self.world_features = np.zeros((F_W, H, W))
-        self.group_features = np.zeros((G, F_G))
 
+        # Occupancy
+        self.world_occupancy = np.zeros((self.G, self.H, self.W), dtype=np.int32)
+
+        # Choose some sparsity factor; tweak as you wish
+        sparsity = 10  # K ≈ (H*W)/10 non-zero cells per group
+        K = max(1, (self.H * self.W) // sparsity)
+
+        for g in range(self.G):
+            # Sample K distinct flat indices
+            flat_indices = self.np_random.choice(self.H * self.W, size=K, replace=False)
+            xs = flat_indices // self.W
+            ys = flat_indices % self.W
+
+            # Occupancy uniform from 1 to 100
+            vals = self.np_random.integers(
+                low=1, high=self.max_strength + 1, size=K, dtype=np.int32
+            )
+            self.world_occupancy[g, xs, ys] = vals
+
+        # World features: dummy normal
+        self.world_features = self.np_random.normal(
+            loc=0.0, scale=1.0, size=(self.F_W, self.H, self.W)
+        )
+
+        # Group features: dummy normal
+        self.group_features = self.np_random.normal(
+            loc=0.0, scale=1.0, size=(self.G, self.F_G)
+        )
+
+        # All agents active at reset
+        self.agents = self.possible_agents[:]
+
+        # In a real ParallelEnv, reset should return (observations, infos)
+        observations = {agent: self._get_observation(agent) for agent in self.agents}
+        infos = {agent: {} for agent in self.agents}
+        return observations, infos
+
+    # ---------------------------------------------------------------------
+    # Internal helpers for strength & similarity
+    # ---------------------------------------------------------------------
+    def _agent_index(self, agent):
+        # agent is "group_k"
+        if isinstance(agent, int):
+            return agent
+        return int(agent.split("_")[-1])
+
+    def _get_group_strength(self, g, x, y):
+        return self.world_occupancy[g, x, y]
+
+    def _set_group_strength(self, g, x, y, val):
+        self.world_occupancy[g, x, y] = max(0, int(val))
+
+    def _group_similarity(self, g1, g2):
         """
-        1. initialize the world_occupancy: for each group, randomly sample K=H*W/sparsity non-zero coordinates x,y and an occupancy value that is uniform from 0 to 100.  
-        2. initialize the world_features: Just use some dummy normal initialization  
-        3. initialize the group_features: Just use some dummy normal initialization  
+        Example similarity: cosine similarity of group_features.
+        Just a dummy implementation for now.
         """
+        v1 = self.group_features[g1]
+        v2 = self.group_features[g2]
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+        if n1 == 0 or n2 == 0:
+            return 0.0
+        return float(np.dot(v1, v2) / (n1 * n2))
 
-    def _get_group_strength(g,x,y):
-        # Dummy value
-        return self.world_occupancy[g][x][y]
+    # ---------------------------------------------------------------------
+    # Action space per group
+    # ---------------------------------------------------------------------
+    def _group_actions(self, g):
+        # same action space for all groups
+        return self._action_space
 
-    def _set_group_strength(g,x,y, val):
-        self.world_occupancy[g][x][y] = val
-    
-    def _group_similarity(g1, g2):
-        raise NotImplementedError()
+    # ---------------------------------------------------------------------
+    # Group interaction for collisions
+    # ---------------------------------------------------------------------
+    def group_interaction(self, x, y):
+        """
+        Tournament mode at position (x, y):
 
-    def _group_actions(g):
-        # For every non-zero value self.world_occupancy[g][x][y], 
-        # integral quantities 0 <= Q1,Q2,Q3,Q4 <= self.world_occupancy[g][x][y] can be moved up/right/down/left 
-        pass
+        1. Gather all non-zero group indices into an array a
+        2. Randomly permute that array a
+        3. Tournament:
+           - a[0] vs a[1], a[2] vs a[3], ...
+           - For each fight, compare strength, update as:
+             s1' = max(0, s1 - s2)
+             s2' = max(0, s2 - s1)
+           - Winner (if still non-zero) goes to next round
+           - Repeat until only one left with non-zero strength (or none)
+        """
+        strengths = self.world_occupancy[:, x, y]
+        active_groups = np.nonzero(strengths > 0)[0]
+        if active_groups.size < 2:
+            return  # no collision
 
-    def group_interaction(x,y):
-        # Dummy interaction: Tournament mode
-        # 1. Gather all non-zero group indices into an array a
-        # 2. Randomly permute the array a
-        # 3. Tournament mode: Contiguous groups fight each other, contiguous winners fight each other, etc.
-        # - a[0] vs. a[1], a[2] vs. a[3]
-        # 3a. For each fight, determine the group with the higher strength via _get_group_strength()
-        #     The strengths of groups with strenghts g1,g2 are updated as max(0, g1 - g2) and max(0, g2 - g1)
-        #     That is, the loser has strength 0 on this position afterwards.
-        #     Use _set_group_strength for that. 
-        # 3b. repeat this for the winners of each fight until there's only one left with non-zero strength
-        pass
+        # Random tournament bracket
+        permuted = self.np_random.permutation(active_groups)
+        current = permuted.tolist()
 
+        while len(current) > 1:
+            next_round = []
+            # Pairwise fights
+            for i in range(0, len(current), 2):
+                if i + 1 >= len(current):
+                    # Odd one out advances automatically
+                    g_odd = current[i]
+                    if self._get_group_strength(g_odd, x, y) > 0:
+                        next_round.append(g_odd)
+                    continue
+
+                g1 = current[i]
+                g2 = current[i + 1]
+
+                s1 = self._get_group_strength(g1, x, y)
+                s2 = self._get_group_strength(g2, x, y)
+
+                # Resolve fight
+                new_s1 = max(0, s1 - s2)
+                new_s2 = max(0, s2 - s1)
+
+                self._set_group_strength(g1, x, y, new_s1)
+                self._set_group_strength(g2, x, y, new_s2)
+
+                # Winner (if non-zero) advances
+                if new_s1 > new_s2 and new_s1 > 0:
+                    next_round.append(g1)
+                elif new_s2 > new_s1 and new_s2 > 0:
+                    next_round.append(g2)
+                # if equal & both zero -> no one advances
+
+            current = next_round
+
+        # At the end, either 0 or 1 non-zero group remains at (x, y)
+        # In either case, world_occupancy is already updated.
+
+    # ---------------------------------------------------------------------
+    # Step: apply actions and resolve collisions
+    # ---------------------------------------------------------------------
     def step(self, actions):
         """
-        1. 
+        1.
         For each group g, for each coord x,y,
         add integral quantities 0 <= Q1,Q2,Q3,Q4 <= self.world_occupancy[g][x][y]
         to their corresponding neighboring quantities.
 
-        2. 
-        For each coord x,y, check whether multiple groups occupy it.
-        That is, self.world_occupancy[g][x][y] > 0 for multiple g
-        In that case, invoke group_interaction(x,y) to resolve the collision.
+        2.
+        For each coord x,y, if multiple groups occupy it (occupancy > 0),
+        invoke group_interaction(x,y).
         """
+        if not self.agents:
+            # No active agents; environment is done
+            return {}, {}, {}, {}, {}
+
         self.time += 1
 
+        # Start from current occupancy
+        new_occ = self.world_occupancy.copy()
+
+        # Directions: 0 = up, 1 = right, 2 = down, 3 = left
+        for agent, act in actions.items():
+            g = self._agent_index(agent)
+
+            # Convert action to (H, W, 4)
+            act = np.asarray(act, dtype=np.int32)
+            act = act.reshape(self.H, self.W, 4)
+
+            # Ensure non-negative and within per-direction cap
+            act = np.clip(act, 0, self.max_strength)
+
+            # Current available occupancy
+            available = new_occ[g]
+
+            # Separate each direction
+            q_up = act[:, :, 0]
+            q_right = act[:, :, 1]
+            q_down = act[:, :, 2]
+            q_left = act[:, :, 3]
+
+            # Zero out flows that would go out of bounds
+            q_up[0, :] = 0
+            q_down[-1, :] = 0
+            q_left[:, 0] = 0
+            q_right[:, -1] = 0
+
+            # Total outgoing per cell
+            total_out = q_up + q_right + q_down + q_left
+
+            # Enforce sum(Q) <= available per cell by rescaling if needed
+            mask = total_out > available
+            if np.any(mask):
+                # Avoid division by zero
+                scale = np.zeros_like(available, dtype=np.float32)
+                scale[mask] = available[mask] / (total_out[mask] + 1e-9).astype(
+                    np.float32
+                )
+
+                # Scale flows
+                q_up = (q_up * scale).astype(np.int32)
+                q_right = (q_right * scale).astype(np.int32)
+                q_down = (q_down * scale).astype(np.int32)
+                q_left = (q_left * scale).astype(np.int32)
+
+                total_out = q_up + q_right + q_down + q_left  # recompute
+
+            # Subtract outgoing from source cells
+            new_occ[g] = available - total_out
+
+            # Add incoming to destination cells via slicing
+            # up: from (x, y) -> (x-1, y)
+            new_occ[g, 0:-1, :] += q_up[1:, :]
+
+            # down: from (x, y) -> (x+1, y)
+            new_occ[g, 1:, :] += q_down[:-1, :]
+
+            # left: from (x, y) -> (x, y-1)
+            new_occ[g, :, 0:-1] += q_left[:, 1:]
+
+            # right: from (x, y) -> (x, y+1)
+            new_occ[g, :, 1:] += q_right[:, :-1]
+
+        # Update occupancy
+        self.world_occupancy = new_occ
+
+        # Sanity check: no negative occupancies
+        assert np.all(self.world_occupancy >= 0)
+
+        # Resolve collisions: cells where ≥2 groups have non-zero occupancy
+        occ_mask = self.world_occupancy > 0  # (G, H, W)
+        collision_counts = np.sum(occ_mask, axis=0)  # (H, W)
+        xs, ys = np.nonzero(collision_counts >= 2)
+
+        for x, y in zip(xs, ys):
+            self.group_interaction(x, y)
+
+        # Build return values (simple global observation, dummy rewards)
+        observations = {agent: self._get_observation(agent) for agent in self.agents}
+        rewards = {agent: 0.0 for agent in self.agents}
+        terminations = {agent: False for agent in self.agents}
+        truncations = {agent: False for agent in self.agents}
+        infos = {agent: {} for agent in self.agents}
+
+        return observations, rewards, terminations, truncations, infos
+
+    # ---------------------------------------------------------------------
+    # Rendering & (pseudo) observation / action space accessors
+    # ---------------------------------------------------------------------
     def render(self):
-        pass
+        # Minimal textual render: sum occupancy per group
+        print(f"Time step: {self.time}")
+        for g in range(self.G):
+            total = int(self.world_occupancy[g].sum())
+            print(f"  Group {g}: total strength = {total}")
+
+    def _get_observation(self, agent):
+        # For now: each agent sees the entire occupancy grid and world features
+        return {
+            "occupancy": self.world_occupancy.copy(),
+            "features": self.world_features.copy(),
+        }
 
     def observation_space(self, agent):
-        # Return the entire occupancy grid, and world feature space
-        return {
-            "occupancy": self.world_occupancy,
-            "features": self.world_features
-        }
+        """
+        NOTE:
+        In proper PettingZoo, this should return a Gymnasium Space, not the
+        actual observation values. But since your docstring says
+        "Return the entire occupancy grid, and world feature space",
+        we keep this as a convenience accessor to current obs.
+        """
+        return self._get_observation(agent)
 
     def action_space(self, agent):
         return self._group_actions(agent)
